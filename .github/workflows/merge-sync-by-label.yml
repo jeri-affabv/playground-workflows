@@ -6,7 +6,7 @@ on:
 
 jobs:
   sync:
-    if: contains(github.event.pull_request.labels.*.name, 'affable-merge-sync') || github.event.label.name == 'affable-merge-sync'
+    if: github.event.action == 'labeled' && github.event.label.name == 'affable-merge-sync'
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
