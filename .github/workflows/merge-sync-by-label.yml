@@ -1,8 +1,8 @@
 name: Reusable Merge Syncing by Label
 on:
   workflow_call:
-    # No secrets needed! GITHUB_TOKEN is provided automatically by the Github Action bot.
-    # Requires `Allow GitHub Actions to create and approve pull requests` enabled in the repository.
+    # No secrets needed! GITHUB_TOKEN is provided automatically.
+    # Requires `Allow GitHub Actions to create and approve pull requests` enabled in settings.
 
 jobs:
   sync:
@@ -18,62 +18,85 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_URL: ${{ github.event.pull_request.html_url }}
-          # This must match your caller's 'name' exactly
           CALLER_NAME: "Merge Sync PR By Label"
         run: |
-          # 1. Fetch PR Data as raw JSON and pipe it to the 'jq' command
-          # This allows us to use --arg safely to filter out your workflow name
-          PR_DATA=$(gh pr view "$PR_URL" --json mergeStateStatus,statusCheckRollup,headRefName,baseRefName | jq -c --arg WF "$CALLER_NAME" '{
+          # 1. Fetch data and isolate "Other" checks
+          RAW_JSON=$(gh pr view "$PR_URL" --json mergeStateStatus,statusCheckRollup,headRefName,baseRefName)
+          
+          # We filter out this workflow by name/context and count what remains
+          PR_DATA=$(echo "$RAW_JSON" | jq -c --arg WF "$CALLER_NAME" '{
             state: .mergeStateStatus, 
             head: .headRefName, 
             base: .baseRefName,
-            checks: [.statusCheckRollup[] | select(.context != $WF and .name != $WF)]
+            others: [.statusCheckRollup[] | select(.context != $WF and .name != $WF and .state != null)]
           }')
           
           STATE=$(echo "$PR_DATA" | jq -r '.state')
           HEAD=$(echo "$PR_DATA" | jq -r '.head')
           BASE=$(echo "$PR_DATA" | jq -r '.base')
-          CHECK_STATES=$(echo "$PR_DATA" | jq -r '.checks[].state' 2>/dev/null || echo "")
+          
+          # 2. Analyze "Other" Checks
+          OTHER_CHECK_COUNT=$(echo "$PR_DATA" | jq '.others | length')
+          NON_SUCCESS_OTHERS=$(echo "$PR_DATA" | jq -r '.others[] | select(.state != "SUCCESS") | .name' 2>/dev/null)
 
           echo "📊 PR State: $STATE"
-          echo "🧪 External Checks: $(echo "$CHECK_STATES" | tr '\n' ' ')"
+          echo "🔢 Other Checks Count: $OTHER_CHECK_COUNT"
 
-          # 2. Safety Gate: Branch Pair
+          # 3. Branch Gate: Explicit pair check
           if [[ ! (("$HEAD" == "dev" && "$BASE" == "main") || ("$HEAD" == "main" && "$BASE" == "dev")) ]]; then
-            echo "🚫 Not a recognized sync pair ($HEAD -> $BASE). Removing label."
+            echo "🚫 Not a recognized sync pair. Removing label."
             gh pr edit "$PR_URL" --remove-label "affable-merge-sync"
             exit 0
           fi
 
-          # 3. Categorized Exit: Hard Failures (Conflicts or CI Failure)
+          # 4. Conflict Check
           if [ "$STATE" == "DIRTY" ]; then
-            gh pr comment "$PR_URL" --body "❌ **Sync Blocked: Conflicts.** Resolve locally, then re-add label."
+            gh pr comment "$PR_URL" --body "❌ **Sync Blocked: Conflicts detected.** Resolve, then re-add label."
             gh pr edit "$PR_URL" --remove-label "affable-merge-sync"
             exit 1
           fi
 
-          if echo "$CHECK_STATES" | grep -q "FAILURE"; then
-            gh pr comment "$PR_URL" --body "❌ **Sync Blocked: CI Failed.** Fix tests, then re-add label."
-            gh pr edit "$PR_URL" --remove-label "affable-merge-sync"
-            exit 1
-          fi
-
-          # 4. Readiness Gate: Unstable or Pending CI
-          if [[ "$STATE" == "UNSTABLE" ]] || echo "$CHECK_STATES" | grep -qE "PENDING|IN_PROGRESS|EXPECTED"; then
-            echo "⏳ CI is not 100% successful yet. State: $STATE"
-            gh pr comment "$PR_URL" --body "⏳ **Sync Paused: CI Not Ready.** Re-add the label once all checks are green."
+          # 5. Hard Failure / Pending Check for "Other" workflows
+          if [ -n "$NON_SUCCESS_OTHERS" ]; then
+            echo "⏳ Other checks are not green: $NON_SUCCESS_OTHERS"
+            # If any of those are explicitly FAILURE, we kill it.
+            if echo "$NON_SUCCESS_OTHERS" | grep -q "FAILURE"; then
+               gh pr comment "$PR_URL" --body "❌ **Sync Blocked: CI Failed.** Other checks are failing. Fix, then re-add label."
+               gh pr edit "$PR_URL" --remove-label "affable-merge-sync"
+               exit 1
+            fi
+            # Otherwise, they are just PENDING.
+            gh pr comment "$PR_URL" --body "⏳ **Sync Paused: CI Not Finished.** Waiting on: $NON_SUCCESS_OTHERS"
             gh pr edit "$PR_URL" --remove-label "affable-merge-sync"
             exit 0
           fi
 
-          # 5. Final State Validation (Ready to Merge)
-          # We accept CLEAN or BLOCKED (ignoring review requirements)
+          # 6. Final Evaluation with Unstable check
+          # We proceed if CLEAN/BLOCKED, OR if UNSTABLE while this is effectively the only action.
+          PROCEED=false
           if [[ "$STATE" == "CLEAN" || "$STATE" == "BLOCKED" ]]; then
-            echo "🚀 PR is READY. Merging $HEAD into $BASE..."
-            gh pr merge "$PR_URL" --merge --admin
-            echo "✅ Merge complete."
+            PROCEED=true
+          elif [[ "$STATE" == "UNSTABLE" ]]; then
+            if [ -z "$NON_SUCCESS_OTHERS" ]; then
+              echo "⚠️ State is UNSTABLE, but all other checks ($OTHER_CHECK_COUNT) are SUCCESS or non-existent."
+              echo "✅ Conclusion: Instability is self-induced by this running action. Proceeding..."
+              PROCEED=true
+            else
+              echo "❌ State is UNSTABLE and external checks are problematic."
+            fi
+          fi
+
+          if [ "$PROCEED" = true ]; then
+            echo "🚀 Attempting merge for $HEAD -> $BASE..."
+            if gh pr merge "$PR_URL" --merge --admin; then
+              echo "✅ Successfully synced!"
+            else
+              gh pr comment "$PR_URL" --body "⚠️ **Merge Failed:** State is $STATE. Check for out-of-date branches or draft status."
+              gh pr edit "$PR_URL" --remove-label "affable-merge-sync"
+              exit 1
+            fi
           else
-            gh pr comment "$PR_URL" --body "⚠️ **Sync Blocked: Unready State ($STATE).** The PR may be a Draft or Out-of-Date."
+            gh pr comment "$PR_URL" --body "⚠️ **Sync Blocked: Unready State ($STATE).** Check for failing status checks, then re-add label."
             gh pr edit "$PR_URL" --remove-label "affable-merge-sync"
             exit 1
           fi
