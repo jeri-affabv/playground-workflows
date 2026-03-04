@@ -1,0 +1,41 @@
+name: Reusable Merge Syncing by Label
+on:
+  workflow_call:
+    # No secrets needed! GITHUB_TOKEN is provided automatically by the Github Action bot.
+    # Requires `Allow GitHub Actions to create and approve pull requests` enabled in the repository.
+
+jobs:
+  sync:
+    if: github.event.label.name == 'affable-merge-sync'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: write
+
+    steps:
+      - name: Validate and Merge
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          HEAD: ${{ github.event.pull_request.head.ref }}
+          BASE: ${{ github.event.pull_request.base.ref }}
+        run: |
+          # Verify the branch pair
+          if [[ ("$HEAD" == "dev" && "$BASE" == "main") || ("$HEAD" == "main" && "$BASE" == "dev") ]]; then
+            echo "✅ Valid sync pair: $HEAD -> $BASE"
+            
+            # Check for git conflicts
+            STATUS=$(gh pr view "$PR_URL" --json mergeable --template '{{.mergeable}}')
+            if [ "$STATUS" == "CONFLICTING" ]; then
+              gh pr comment "$PR_URL" --body "❌ Manual Sync Failed: This PR has conflicts."
+              exit 1
+            fi
+
+            # Approve and Merge
+            gh pr review "$PR_URL" --approve
+            gh pr merge "$PR_URL" --merge --auto
+          else
+            echo "🚫 Not a dev/main sync PR. Removing label..."
+            gh pr edit "$PR_URL" --remove-label "affable-merge-sync"
+          fi
