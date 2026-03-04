@@ -18,28 +18,29 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_URL: ${{ github.event.pull_request.html_url }}
-          # The name of the job defined in your YAML
           JOB_NAME: "sync"
         run: |
           # 1. Fetch data
           RAW_JSON=$(gh pr view "$PR_URL" --json mergeStateStatus,statusCheckRollup,headRefName,baseRefName)
           
-          # 2. Extract and Filter
-          # We count 'ourselves' separately to verify the filter works.
-          SELF_COUNT=$(echo "$RAW_JSON" | jq -r --arg JOB "$JOB_NAME" '.statusCheckRollup[] | select((.name | test("(.*/ )?" + $JOB + "$")) or (.context | test("(.*/ )?" + $JOB + "$"))) | .name' | wc -l)
+          # 2. Extract and Filter (with Null-Safety)
+          # We use ( .name // "" ) to provide an empty string default if the field is null.
+          SELF_COUNT=$(echo "$RAW_JSON" | jq -r --arg JOB "$JOB_NAME" '.statusCheckRollup[] | select((( .name // "" ) | test("(.*/ )?" + $JOB + "$")) or (( .context // "" ) | test("(.*/ )?" + $JOB + "$"))) | .name' | wc -l)
           
           PR_DATA=$(echo "$RAW_JSON" | jq -c --arg JOB "$JOB_NAME" '{
             state: .mergeStateStatus, 
             head: .headRefName, 
             base: .baseRefName,
             others: [.statusCheckRollup[] | select(
-              ((.name | test("(.*/ )?" + $JOB + "$")) or (.context | test("(.*/ )?" + $JOB + "$")) | not) and
+              ((( .name // "" ) | test("(.*/ )?" + $JOB + "$")) or (( .context // "" ) | test("(.*/ )?" + $JOB + "$")) | not) and
               (.name != "Strict Validation and Merge")
             )]
           }')
           
           STATE=$(echo "$PR_DATA" | jq -r '.state')
           OTHER_COUNT=$(echo "$PR_DATA" | jq '.others | length')
+          HEAD=$(echo "$PR_DATA" | jq -r '.head')
+          BASE=$(echo "$PR_DATA" | jq -r '.base')
           
           # 3. List all checks that aren't SUCCESS (Pending, Failed, etc.)
           NON_SUCCESS_OTHERS=$(echo "$PR_DATA" | jq -r '.others[] | select(.conclusion != "SUCCESS" and .state != "SUCCESS") | .name' 2>/dev/null | xargs)
@@ -60,9 +61,9 @@ jobs:
             echo "⏳ Other checks are not green: $NON_SUCCESS_OTHERS"
             
             if echo "$PR_DATA" | jq -r '.others[] | .conclusion, .state' | grep -q "FAILURE"; then
-               gh pr comment "$PR_URL" --body "❌ **Sync Blocked: CI Failed.** The following checks failed: $NON_SUCCESS_OTHERS. Fix, then re-add label."
+               gh pr comment "$PR_URL" --body "❌ **Sync Blocked: CI Failed.** Checks failed: $NON_SUCCESS_OTHERS. Fix, then re-add label."
             else
-               gh pr comment "$PR_URL" --body "⏳ **Sync Paused: CI Incomplete.** Waiting on: $NON_SUCCESS_OTHERS. Re-add the label once they are all green."
+               gh pr comment "$PR_URL" --body "⏳ **Sync Paused: CI Incomplete.** Waiting on: $NON_SUCCESS_OTHERS. Re-add label once green."
             fi
             
             gh pr edit "$PR_URL" --remove-label "affable-merge-sync"
@@ -74,7 +75,6 @@ jobs:
           if [[ "$STATE" == "CLEAN" || "$STATE" == "BLOCKED" ]]; then
             PROCEED=true
           elif [[ "$STATE" == "UNSTABLE" ]]; then
-            # If we are here, NON_SUCCESS_OTHERS is guaranteed empty.
             echo "⚠️ State is UNSTABLE, but all $OTHER_COUNT external checks are SUCCESS."
             echo "✅ Conclusion: Instability is self-induced. Proceeding..."
             PROCEED=true
@@ -90,7 +90,4 @@ jobs:
               exit 1
             fi
           else
-            gh pr comment "$PR_URL" --body "⚠️ **Sync Blocked:** PR state is $STATE. Complete other checks first."
-            gh pr edit "$PR_URL" --remove-label "affable-merge-sync"
-            exit 1
-          fi
+            gh pr comment "$PR
