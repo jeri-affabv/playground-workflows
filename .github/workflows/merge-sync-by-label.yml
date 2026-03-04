@@ -1,4 +1,19 @@
-- name: Strict Validation and Merge
+name: Reusable Merge Syncing by Label
+on:
+  workflow_call:
+    # No secrets needed! GITHUB_TOKEN is provided automatically.
+    # Requires `Allow GitHub Actions to create and approve pull requests` enabled in settings.
+
+jobs:
+  sync:
+    if: contains(github.event.pull_request.labels.*.name, 'affable-merge-sync') || github.event.label.name == 'affable-merge-sync'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: write
+
+    steps:
+      - name: Strict Validation and Merge
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
