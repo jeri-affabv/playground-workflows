@@ -73,7 +73,7 @@ jobs:
               echo "Error: PR is a Draft."
               gh pr edit "$PR_URL" --remove-label "affable-merge-sync"
               gh pr comment "$PR_URL" --body "❌ **Sync Blocked:** Mark the PR as 'Ready for Review' first."
-              exit 1
+              exit 0
           fi
 
           IS_SYNC_PAIR=0
@@ -84,21 +84,21 @@ jobs:
               echo "Error: Invalid sync pair ($HEAD -> $BASE)."
               gh pr comment "$PR_URL" --body "❌ **Invalid:** Only dev<->main PRs are allowed for this action."
               gh pr edit "$PR_URL" --remove-label "affable-merge-sync"
-              exit 1
+              exit 0
           fi
 
           if [[ -n "$OTHER_FAILURES" ]]; then
               echo "Blocking: External CI failed: $OTHER_FAILURES"
               gh pr comment "$PR_URL" --body "❌ **Sync Blocked: CI Failed.** Fix CI before re-adding label. Fix: $OTHER_FAILURES"
               gh pr edit "$PR_URL" --remove-label "affable-merge-sync"
-              exit 1
+              exit 0
           fi
 
           if [[ -n "$OTHER_PENDING" ]]; then
               echo "Aborting: External CI incomplete: $OTHER_PENDING"
               gh pr comment "$PR_URL" --body "⏳ **Sync Aborted: CI Incomplete.** Wait for CI to complete before re-adding label. Waiting on: $OTHER_PENDING"
               gh pr edit "$PR_URL" --remove-label "affable-merge-sync"
-              exit 1
+              exit 0
           fi
 
           # 4. Evaluation
@@ -124,11 +124,11 @@ jobs:
                   echo "Error: GitHub API rejected the merge."
                   gh pr comment "$PR_URL" --body "❌ **Merge Failed:** GitHub rejected the request to merge this PR."
                   gh pr edit "$PR_URL" --remove-label "affable-merge-sync"
-                  exit 1
+                  exit 0
               fi
           else
               echo "Error: PR state ($STATE) not ready."
               gh pr comment "$PR_URL" --body "❌ **Sync Aborted:** PR state ($STATE) not ready."
               gh pr edit "$PR_URL" --remove-label "affable-merge-sync"
-              exit 1
+              exit 0
           fi
