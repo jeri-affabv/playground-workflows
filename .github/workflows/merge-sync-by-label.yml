@@ -3,7 +3,7 @@ on:
   workflow_call:
     # No secrets needed! GITHUB_TOKEN is provided automatically.
     # Requires `Allow GitHub Actions to create and approve pull requests` enabled in settings.
-
+    
 jobs:
   sync:
     if: contains(github.event.pull_request.labels.*.name, 'affable-merge-sync') || github.event.label.name == 'affable-merge-sync'
@@ -20,82 +20,78 @@ jobs:
           PR_URL: ${{ github.event.pull_request.html_url }}
           JOB_NAME: "sync"
         run: |
-          # 1. Fetch data
-          RAW_JSON=$(gh pr view "$PR_URL" --json mergeStateStatus,statusCheckRollup,headRefName,baseRefName)
-          
-          # 2. Extract and Filter (Null-Safe)
-          # We count 'ourselves' to ensure filtering is active
-          SELF_COUNT=$(echo "$RAW_JSON" | jq -r --arg JOB "$JOB_NAME" '.statusCheckRollup[] | select((( .name // "" ) | test("(.*/ )?" + $JOB + "$")) or (( .context // "" ) | test("(.*/ )?" + $JOB + "$"))) | .name' | wc -l)
-          
-          PR_DATA=$(echo "$RAW_JSON" | jq -c --arg JOB "$JOB_NAME" '{
-            state: .mergeStateStatus, 
-            head: .headRefName, 
-            base: .baseRefName,
-            others: [.statusCheckRollup[] | select(
-              ((( .name // "" ) | test("(.*/ )?" + $JOB + "$")) or (( .context // "" ) | test("(.*/ )?" + $JOB + "$")) | not) and
-              (.name != "Strict Validation and Merge")
-            )]
-          }')
-          
-          STATE=$(echo "$PR_DATA" | jq -r '.state')
-          OTHER_COUNT=$(echo "$PR_DATA" | jq '.others | length')
-          HEAD=$(echo "$PR_DATA" | jq -r '.head')
-          BASE=$(echo "$PR_DATA" | jq -r '.base')
-          
-          # 3. List all checks that aren't SUCCESS
-          NON_SUCCESS_OTHERS=$(echo "$PR_DATA" | jq -r '.others[] | select(.conclusion != "SUCCESS" and .state != "SUCCESS") | .name' 2>/dev/null | xargs)
+          # We use a subshell to ensure variables don't bleed and quotes are isolated
+          (
+            set -e
 
-          echo "📊 PR State: $STATE"
-          echo "🤖 Internal Sync instances ignored: $SELF_COUNT"
-          echo "🔢 Total External Checks Found: $OTHER_COUNT"
+            # 1. Fetch data
+            RAW_JSON=$(gh pr view "$PR_URL" --json mergeStateStatus,statusCheckRollup,headRefName,baseRefName)
 
-          # 4. Branch Gate
-          IS_VALID_PAIR="false"
-          if [[ "$HEAD" == "dev" && "$BASE" == "main" ]]; then IS_VALID_PAIR="true"; fi
-          if [[ "$HEAD" == "main" && "$BASE" == "dev" ]]; then IS_VALID_PAIR="true"; fi
+            # 2. Extract and Filter (Null-Safe)
+            # Use separate JQ calls to avoid complex nesting errors
+            STATE=$(echo "$RAW_JSON" | jq -r '.mergeStateStatus')
+            HEAD=$(echo "$RAW_JSON" | jq -r '.headRefName')
+            BASE=$(echo "$RAW_JSON" | jq -r '.baseRefName')
+            
+            # Count internal sync instances
+            SELF_COUNT=$(echo "$RAW_JSON" | jq -r --arg JOB "$JOB_NAME" '.statusCheckRollup[] | select((( .name // "" ) | test("(.*/ )?" + $JOB + "$")) or (( .context // "" ) | test("(.*/ )?" + $JOB + "$"))) | .name' | wc -l)
 
-          if [[ "$IS_VALID_PAIR" == "false" ]]; then
-            echo "🚫 Not a recognized sync pair ($HEAD -> $BASE). Removing label."
-            gh pr edit "$PR_URL" --remove-label "affable-merge-sync"
-            exit 0
-          fi
+            # Filter out this job and find external checks
+            OTHERS_JSON=$(echo "$RAW_JSON" | jq -c --arg JOB "$JOB_NAME" '[.statusCheckRollup[] | select(((( .name // "" ) | test("(.*/ )?" + $JOB + "$")) or (( .context // "" ) | test("(.*/ )?" + $JOB + "$")) | not) and (.name != "Strict Validation and Merge"))]')
+            OTHER_COUNT=$(echo "$OTHERS_JSON" | jq 'length')
+            
+            # Find non-successful ones
+            NON_SUCCESS_OTHERS=$(echo "$OTHERS_JSON" | jq -r '.[] | select(.conclusion != "SUCCESS" and .state != "SUCCESS") | .name' 2>/dev/null | xargs)
 
-          # 5. External Action Gate
-          if [[ -n "$NON_SUCCESS_OTHERS" ]]; then
-            echo "⏳ External checks incomplete: $NON_SUCCESS_OTHERS"
-            if echo "$PR_DATA" | jq -r '.others[] | .conclusion, .state' | grep -q "FAILURE"; then
-               gh pr comment "$PR_URL" --body "❌ **Sync Blocked: CI Failed.** Checks failed: $NON_SUCCESS_OTHERS."
+            echo "📊 PR State: $STATE"
+            echo "🤖 Internal Sync instances ignored: $SELF_COUNT"
+            echo "🔢 Total External Checks Found: $OTHER_COUNT"
+
+            # 3. Branch Gate
+            if [[ "$HEAD" == "dev" && "$BASE" == "main" ]] || [[ "$HEAD" == "main" && "$BASE" == "dev" ]]; then
+                echo "✅ Valid sync pair: $HEAD -> $BASE"
             else
-               gh pr comment "$PR_URL" --body "⏳ **Sync Paused: CI Incomplete.** Waiting on: $NON_SUCCESS_OTHERS."
+                echo "🚫 Not a recognized sync pair ($HEAD -> $BASE). Removing label."
+                gh pr edit "$PR_URL" --remove-label "affable-merge-sync"
+                exit 0
             fi
-            gh pr edit "$PR_URL" --remove-label "affable-merge-sync"
-            exit 0
-          fi
 
-          # 6. Final Evaluation
-          PROCEED="false"
-          if [[ "$STATE" == "CLEAN" || "$STATE" == "BLOCKED" ]]; then
-            PROCEED="true"
-          elif [[ "$STATE" == "UNSTABLE" ]]; then
-            echo "✅ Conclusion: Instability is self-induced. Proceeding..."
-            PROCEED="true"
-          fi
+            # 4. External Action Gate
+            if [[ -n "$NON_SUCCESS_OTHERS" ]]; then
+                echo "⏳ External checks incomplete: $NON_SUCCESS_OTHERS"
+                if echo "$OTHERS_JSON" | jq -r '.[] | .conclusion, .state' | grep -q "FAILURE"; then
+                    gh pr comment "$PR_URL" --body "❌ **Sync Blocked: CI Failed.** Checks failed: $NON_SUCCESS_OTHERS."
+                else
+                    gh pr comment "$PR_URL" --body "⏳ **Sync Paused: CI Incomplete.** Waiting on: $NON_SUCCESS_OTHERS."
+                fi
+                gh pr edit "$PR_URL" --remove-label "affable-merge-sync"
+                exit 0
+            fi
 
-          # 7. Execution
-          if [[ "$PROCEED" == "true" ]]; then
-            echo "🚀 Attempting merge..."
-            # Capture output and exit code without crashing shell
-            if gh pr merge "$PR_URL" --merge --admin; then
-              echo "✅ Successfully synced!"
+            # 5. Final Evaluation
+            PROCEED="false"
+            if [[ "$STATE" == "CLEAN" || "$STATE" == "BLOCKED" ]]; then
+                PROCEED="true"
+            elif [[ "$STATE" == "UNSTABLE" ]]; then
+                echo "⚠️ State is UNSTABLE, but external checks are green. Proceeding..."
+                PROCEED="true"
+            fi
+
+            # 6. Execution
+            if [[ "$PROCEED" == "true" ]]; then
+                echo "🚀 Attempting merge..."
+                if gh pr merge "$PR_URL" --merge --admin; then
+                    echo "✅ Successfully synced!"
+                else
+                    echo "❌ Merge command failed."
+                    gh pr comment "$PR_URL" --body "⚠️ **Merge Failed:** State is $STATE. GitHub rejected the merge. Check for out-of-date branches."
+                    gh pr edit "$PR_URL" --remove-label "affable-merge-sync"
+                    exit 1
+                fi
             else
-              echo "❌ Merge command failed."
-              gh pr comment "$PR_URL" --body "⚠️ **Merge Failed:** State is $STATE. GitHub rejected the merge. Check for out-of-date branches."
-              gh pr edit "$PR_URL" --remove-label "affable-merge-sync"
-              exit 1
+                echo "❌ State is $STATE. No bypass valid."
+                gh pr comment "$PR_URL" --body "⚠️ **Sync Blocked:** PR state ($STATE) is not ready for automated sync."
+                gh pr edit "$PR_URL" --remove-label "affable-merge-sync"
+                exit 1
             fi
-          else
-            echo "❌ State is $STATE. No bypass valid."
-            gh pr comment "$PR_URL" --body "⚠️ **Sync Blocked:** PR state ($STATE) is not ready for automated sync."
-            gh pr edit "$PR_URL" --remove-label "affable-merge-sync"
-            exit 1
-          fi
+          )
