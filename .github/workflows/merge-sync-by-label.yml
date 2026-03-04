@@ -51,7 +51,7 @@ jobs:
             exit 1
           fi
 
-          if echo "$CHECK_STATES" | grep -qE "PENDING|IN_PROGRESS|EXPECTED"; then
+          if echo "$CHECK_STATES" | grep -qE "PENDING|IN_PROGRESS|EXPECTED|UNSTABLE"; then
             gh pr comment "$PR_URL" --body "⏳ **Sync Paused: CI Still Running.** Re-add label once checks are green."
             gh pr edit "$PR_URL" --remove-label "affable-merge-sync"
             exit 0
