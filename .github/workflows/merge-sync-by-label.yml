@@ -39,7 +39,7 @@ jobs:
           # 3. Conflict Check (Hard Block)
           if [ "$STATE" == "DIRTY" ]; then
             gh pr comment "$PR_URL" --body "❌ **Sync Blocked: Conflicts**
-            **Next Step:** You must resolve conflicts locally. Label removed."
+            **Next Step:** You must resolve conflicts. Label removed."
             gh pr edit "$PR_URL" --remove-label "affable-merge-sync"
             exit 1
           fi
