@@ -21,14 +21,14 @@ jobs:
           # This must match your caller's 'name' exactly
           CALLER_NAME: "Merge Sync PR By Label"
         run: |
-          # 1. Fetch PR Data & Filter out this workflow's own checks
-          PR_DATA=$(gh pr view "$PR_URL" --json mergeStateStatus,statusCheckRollup,headRefName,baseRefName \
-            --jq --arg WF "$CALLER_NAME" '{
-              state: .mergeStateStatus, 
-              head: .headRefName, 
-              base: .baseRefName,
-              checks: [.statusCheckRollup[] | select(.context != $WF and .name != $WF)]
-            }')
+          # 1. Fetch PR Data as raw JSON and pipe it to the 'jq' command
+          # This allows us to use --arg safely to filter out your workflow name
+          PR_DATA=$(gh pr view "$PR_URL" --json mergeStateStatus,statusCheckRollup,headRefName,baseRefName | jq -c --arg WF "$CALLER_NAME" '{
+            state: .mergeStateStatus, 
+            head: .headRefName, 
+            base: .baseRefName,
+            checks: [.statusCheckRollup[] | select(.context != $WF and .name != $WF)]
+          }')
           
           STATE=$(echo "$PR_DATA" | jq -r '.state')
           HEAD=$(echo "$PR_DATA" | jq -r '.head')
