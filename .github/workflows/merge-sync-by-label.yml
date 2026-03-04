@@ -6,36 +6,58 @@ on:
 
 jobs:
   sync:
-    if: github.event.label.name == 'affable-merge-sync'
+    # Only run if the PR has our specific label
+    if: contains(github.event.pull_request.labels.*.name, 'affable-merge-sync') || github.event.label.name == 'affable-merge-sync'
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
       contents: write
 
     steps:
-      - name: Validate and Merge
+      - name: Validate, Check CI, and Merge
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_URL: ${{ github.event.pull_request.html_url }}
-          HEAD: ${{ github.event.pull_request.head.ref }}
-          BASE: ${{ github.event.pull_request.base.ref }}
+          # Handles triggers from both PR events and Check Run events
+          PR_URL: ${{ github.event.pull_request.html_url || github.event.check_run.pull_requests[0].html_url }}
         run: |
-          # Verify the branch pair
-          if [[ ("$HEAD" == "dev" && "$BASE" == "main") || ("$HEAD" == "main" && "$BASE" == "dev") ]]; then
-            echo "✅ Valid sync pair: $HEAD -> $BASE"
-            
-            # Check for git conflicts
-            STATUS=$(gh pr view "$PR_URL" --json mergeable --template '{{.mergeable}}')
-            if [ "$STATUS" == "CONFLICTING" ]; then
-              gh pr comment "$PR_URL" --body "❌ Manual Sync Failed: This PR has conflicts."
-              exit 1
-            fi
+          # 1. Fetch PR Data
+          PR_DATA=$(gh pr view "$PR_URL" --json mergeStateStatus,statusCheckRollup,headRefName,baseRefName --jq '{state: .mergeStateStatus, checks: .statusCheckRollup, head: .headRefName, base: .baseRefName}')
+          
+          STATE=$(echo "$PR_DATA" | jq -r '.state')
+          HEAD=$(echo "$PR_DATA" | jq -r '.head')
+          BASE=$(echo "$PR_DATA" | jq -r '.base')
+          CHECK_STATES=$(echo "$PR_DATA" | jq -r '.checks[].state' 2>/dev/null || echo "")
 
-            # Approve and Merge
-            gh pr review "$PR_URL" --approve
-            gh pr merge "$PR_URL" --merge --auto
-          else
-            echo "🚫 Not a dev/main sync PR. Removing label..."
+          # 2. Safety Gate: Only dev/main pairs
+          if [[ ! (("$HEAD" == "dev" && "$BASE" == "main") || ("$HEAD" == "main" && "$BASE" == "dev")) ]]; then
+            echo "🚫 Not a sync pair ($HEAD -> $BASE). Removing label."
             gh pr edit "$PR_URL" --remove-label "affable-merge-sync"
+            exit 0
           fi
+
+          # 3. Conflict Check (Hard Block)
+          if [ "$STATE" == "DIRTY" ]; then
+            gh pr comment "$PR_URL" --body "❌ **Sync Blocked: Conflicts**
+            **Next Step:** You must resolve conflicts locally. Label removed."
+            gh pr edit "$PR_URL" --remove-label "affable-merge-sync"
+            exit 1
+          fi
+
+          # 4. CI Failure Check (Hard Block)
+          if echo "$CHECK_STATES" | grep -q "FAILURE"; then
+            gh pr comment "$PR_URL" --body "❌ **Sync Blocked: CI Failed**
+            **Next Step:** Fix your code/tests. Once green, re-add the \`affable-merge-sync\` label."
+            gh pr edit "$PR_URL" --remove-label "affable-merge-sync"
+            exit 1
+          fi
+
+          # 5. Pending Check (Silent Wait)
+          if echo "$CHECK_STATES" | grep -qE "PENDING|IN_PROGRESS|EXPECTED"; then
+            echo "⏳ CI is still running. This workflow will retry automatically when checks complete."
+            exit 0
+          fi
+
+          # 6. Success! Merge.
+          echo "🚀 All checks passed. Merging with Admin bypass..."
+          gh pr merge "$PR_URL" --merge --admin
