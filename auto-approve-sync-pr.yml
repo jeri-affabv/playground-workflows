@@ -1,0 +1,27 @@
+name: Reusable Auto Approval for Dev-Main Syncing PRs
+on:
+  workflow_call:
+    secrets:
+      APP_ID:
+        required: true
+      APP_PRIVATE_KEY:
+        required: true
+
+jobs:
+  approve:
+    runs-on: ubuntu-latest
+    if: >
+      (github.event.pull_request.head.ref == 'dev' && github.event.pull_request.base.ref == 'main') ||
+      (github.event.pull_request.head.ref == 'main' && github.event.pull_request.base.ref == 'dev')
+    steps:
+      - name: Generate Temporary Token
+        id: generate_token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: Auto-Approve PR
+        uses: hmarr/auto-approve-action@v4
+        with:
+          github-token: ${{ steps.generate_token.outputs.token }}
