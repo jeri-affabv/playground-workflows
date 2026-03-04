@@ -9,7 +9,9 @@ jobs:
     if: github.event.action == 'labeled' && github.event.label.name == 'affable-merge-sync'
     runs-on: ubuntu-latest
     permissions:
+      # required to approve, add comments, and remove labels
       pull-requests: write
+      # required to merge
       contents: write
 
     steps:
@@ -18,9 +20,9 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_URL: ${{ github.event.pull_request.html_url }}
-          JOB_NAME: "sync"
+          JOB_NAME: "sync" 
         run: |
-          # 1. Fetch raw data (Added isDraft check)
+          # 1. Fetch raw PR data
           RAW_JSON=$(gh pr view "$PR_URL" --json mergeStateStatus,statusCheckRollup,headRefName,baseRefName,isDraft)
 
           STATE=$(echo "$RAW_JSON" | jq -r '.mergeStateStatus')
@@ -29,6 +31,9 @@ jobs:
           IS_DRAFT=$(echo "$RAW_JSON" | jq -r '.isDraft')
 
           # 2. Extract checks into a format Bash can loop through safely
+          # Example:
+          # call-sync / sync|sync|SUCCESS|success
+          # test|test|PENDING|null
           ALL_CHECKS=$(echo "$RAW_JSON" | jq -r '.statusCheckRollup[] | "\(.name)|\(.context)|\(.state)|\(.conclusion)"')
 
           OTHER_FAILURES=""
@@ -36,8 +41,9 @@ jobs:
           OTHER_COUNT=0
           SELF_COUNT=0
 
+          # Differentiate check by this workflow from other workflows so we don't tag the PR as waiting for checks when only this workflow is running
           while IFS="|" read -r c_name c_context c_state c_conclusion; do
-              # Determine if this check is 'us'
+              # Determine if this check is by this workflow itself
               is_self=0
               if [[ "$c_name" == "$JOB_NAME" ]] || [[ "$c_context" == "$JOB_NAME" ]] || [[ "$c_name" == *" / $JOB_NAME" ]]; then
                   is_self=1
@@ -67,7 +73,7 @@ jobs:
               echo "Error: PR is a Draft."
               gh pr edit "$PR_URL" --remove-label "affable-merge-sync"
               gh pr comment "$PR_URL" --body "❌ **Sync Blocked:** Mark the PR as 'Ready for Review' first."
-              exit 0
+              exit 1
           fi
 
           IS_SYNC_PAIR=0
@@ -76,28 +82,30 @@ jobs:
 
           if [ "$IS_SYNC_PAIR" -eq 0 ]; then
               echo "Error: Invalid sync pair ($HEAD -> $BASE)."
+              gh pr comment "$PR_URL" --body "❌ **Invalid:** Only dev<->main PRs are allowed for this action."
               gh pr edit "$PR_URL" --remove-label "affable-merge-sync"
-              exit 0
+              exit 1
           fi
 
           if [[ -n "$OTHER_FAILURES" ]]; then
               echo "Blocking: External CI failed: $OTHER_FAILURES"
-              gh pr comment "$PR_URL" --body "❌ **Sync Blocked: CI Failed.** Fix: $OTHER_FAILURES"
+              gh pr comment "$PR_URL" --body "❌ **Sync Blocked: CI Failed.** Fix CI before re-adding label. Fix: $OTHER_FAILURES"
               gh pr edit "$PR_URL" --remove-label "affable-merge-sync"
-              exit 0
+              exit 1
           fi
 
           if [[ -n "$OTHER_PENDING" ]]; then
-              echo "Pausing: External CI incomplete: $OTHER_PENDING"
-              gh pr comment "$PR_URL" --body "⏳ **Sync Paused: CI Incomplete.** Waiting on: $OTHER_PENDING"
+              echo "Aborting: External CI incomplete: $OTHER_PENDING"
+              gh pr comment "$PR_URL" --body "⏳ **Sync Aborted: CI Incomplete.** Wait for CI to complete before re-adding label. Waiting on: $OTHER_PENDING"
               gh pr edit "$PR_URL" --remove-label "affable-merge-sync"
-              exit 0
+              exit 1
           fi
 
           # 4. Evaluation
           PROCEED=0
           if [[ "$STATE" == "CLEAN" ]] || [[ "$STATE" == "BLOCKED" ]]; then
               PROCEED=1
+          # Branch can be in an unstable state while there's a remaining action (like this one itself)
           elif [[ "$STATE" == "UNSTABLE" ]]; then
               echo "State is UNSTABLE, but external checks are green. Proceeding..."
               PROCEED=1
@@ -111,14 +119,16 @@ jobs:
               echo "Attempting merge..."
               if gh pr merge "$PR_URL" --merge --admin; then
                   echo "Success: PR Merged."
+                  exit 0
               else
                   echo "Error: GitHub API rejected the merge."
-                  gh pr comment "$PR_URL" --body "❌ **Merge Failed:** GitHub rejected the request. This usually means a branch protection rule requires a review from a *different* user than the one who triggered this sync."
+                  gh pr comment "$PR_URL" --body "❌ **Merge Failed:** GitHub rejected the request to merge this PR."
                   gh pr edit "$PR_URL" --remove-label "affable-merge-sync"
                   exit 1
               fi
           else
               echo "Error: PR state ($STATE) not ready."
+              gh pr comment "$PR_URL" --body "❌ **Sync Aborted:** PR state ($STATE) not ready."
               gh pr edit "$PR_URL" --remove-label "affable-merge-sync"
               exit 1
           fi
