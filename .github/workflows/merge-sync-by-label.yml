@@ -18,40 +18,35 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_URL: ${{ github.event.pull_request.html_url }}
-          # Use both the workflow name and the job ID to ensure we find "ourselves"
-          WF_NAME: "Reusable Merge Syncing by Label"
-          JOB_ID: "sync"
+          # The name of the job defined in your YAML
+          JOB_NAME: "sync"
         run: |
           # 1. Fetch data
           RAW_JSON=$(gh pr view "$PR_URL" --json mergeStateStatus,statusCheckRollup,headRefName,baseRefName)
           
-          # 2. Isolate "Other" checks
-          # We REMOVE the '.state != null' filter so we can actually see PENDING checks.
-          # We filter out this workflow by name, job ID, and the "caller" name.
-          PR_DATA=$(echo "$RAW_JSON" | jq -c --arg WF "$WF_NAME" --arg JOB "$JOB_ID" '{
+          # 2. Extract and Filter
+          # We count 'ourselves' separately to verify the filter works.
+          SELF_COUNT=$(echo "$RAW_JSON" | jq -r --arg JOB "$JOB_NAME" '.statusCheckRollup[] | select((.name | test("(.*/ )?" + $JOB + "$")) or (.context | test("(.*/ )?" + $JOB + "$"))) | .name' | wc -l)
+          
+          PR_DATA=$(echo "$RAW_JSON" | jq -c --arg JOB "$JOB_NAME" '{
             state: .mergeStateStatus, 
             head: .headRefName, 
             base: .baseRefName,
             others: [.statusCheckRollup[] | select(
-              (.context != $WF and .name != $WF) and 
-              (.context != $JOB and .name != $JOB) and
+              ((.name | test("(.*/ )?" + $JOB + "$")) or (.context | test("(.*/ )?" + $JOB + "$")) | not) and
               (.name != "Strict Validation and Merge")
             )]
           }')
           
           STATE=$(echo "$PR_DATA" | jq -r '.state')
-          HEAD=$(echo "$PR_DATA" | jq -r '.head')
-          BASE=$(echo "$PR_DATA" | jq -r '.base')
+          OTHER_COUNT=$(echo "$PR_DATA" | jq '.others | length')
           
-          # 3. Analyze "Other" Checks
-          OTHER_CHECK_COUNT=$(echo "$PR_DATA" | jq '.others | length')
-          
-          # A check is "Non-Success" if both its 'conclusion' and 'state' are not SUCCESS
-          # This captures PENDING (null), FAILURE, and CANCELLED.
-          NON_SUCCESS_OTHERS=$(echo "$PR_DATA" | jq -r '.others[] | select(.conclusion != "SUCCESS" and .state != "SUCCESS") | .name' 2>/dev/null)
+          # 3. List all checks that aren't SUCCESS (Pending, Failed, etc.)
+          NON_SUCCESS_OTHERS=$(echo "$PR_DATA" | jq -r '.others[] | select(.conclusion != "SUCCESS" and .state != "SUCCESS") | .name' 2>/dev/null | xargs)
 
           echo "📊 PR State: $STATE"
-          echo "🔢 Total Other Checks Found: $OTHER_CHECK_COUNT"
+          echo "🤖 Internal Sync instances ignored: $SELF_COUNT"
+          echo "🔢 Total External Checks Found: $OTHER_COUNT"
 
           # 4. Branch Gate
           if [[ ! (("$HEAD" == "dev" && "$BASE" == "main") || ("$HEAD" == "main" && "$BASE" == "dev")) ]]; then
@@ -60,45 +55,42 @@ jobs:
             exit 0
           fi
 
-          # 5. Handle Other Running/Failing CI
+          # 5. The External Action Gate
           if [ -n "$NON_SUCCESS_OTHERS" ]; then
             echo "⏳ Other checks are not green: $NON_SUCCESS_OTHERS"
             
-            # Check for hard failures in others
             if echo "$PR_DATA" | jq -r '.others[] | .conclusion, .state' | grep -q "FAILURE"; then
-               gh pr comment "$PR_URL" --body "❌ **Sync Blocked: CI Failed.** External checks are failing. Fix, then re-add label."
-               gh pr edit "$PR_URL" --remove-label "affable-merge-sync"
-               exit 1
+               gh pr comment "$PR_URL" --body "❌ **Sync Blocked: CI Failed.** The following checks failed: $NON_SUCCESS_OTHERS. Fix, then re-add label."
+            else
+               gh pr comment "$PR_URL" --body "⏳ **Sync Paused: CI Incomplete.** Waiting on: $NON_SUCCESS_OTHERS. Re-add the label once they are all green."
             fi
             
-            # If not failed, they are just still running
-            echo "⏳ Waiting for other CI to finish..."
+            gh pr edit "$PR_URL" --remove-label "affable-merge-sync"
             exit 0
           fi
 
           # 6. Final Evaluation
-          # If we reach here, NON_SUCCESS_OTHERS is empty (meaning all others are SUCCESS or there are no others).
           PROCEED=false
           if [[ "$STATE" == "CLEAN" || "$STATE" == "BLOCKED" ]]; then
             PROCEED=true
           elif [[ "$STATE" == "UNSTABLE" ]]; then
-            # Since NON_SUCCESS_OTHERS is empty, the UNSTABLE state MUST be caused by 'this' running action.
-            echo "⚠️ State is UNSTABLE, but all ($OTHER_CHECK_COUNT) external checks are SUCCESS."
+            # If we are here, NON_SUCCESS_OTHERS is guaranteed empty.
+            echo "⚠️ State is UNSTABLE, but all $OTHER_COUNT external checks are SUCCESS."
             echo "✅ Conclusion: Instability is self-induced. Proceeding..."
             PROCEED=true
           fi
 
           if [ "$PROCEED" = true ]; then
-            echo "🚀 Attempting merge for $HEAD -> $BASE..."
+            echo "🚀 Attempting merge..."
             if gh pr merge "$PR_URL" --merge --admin; then
               echo "✅ Successfully synced!"
             else
-              gh pr comment "$PR_URL" --body "⚠️ **Merge Failed:** State is $STATE. Branch may be out of date."
+              gh pr comment "$PR_URL" --body "⚠️ **Merge Failed:** State is $STATE. Branch may be out of sync."
               gh pr edit "$PR_URL" --remove-label "affable-merge-sync"
               exit 1
             fi
           else
-            echo "❌ State is $STATE and conditions for bypass weren't met."
+            gh pr comment "$PR_URL" --body "⚠️ **Sync Blocked:** PR state is $STATE. Complete other checks first."
             gh pr edit "$PR_URL" --remove-label "affable-merge-sync"
             exit 1
           fi
